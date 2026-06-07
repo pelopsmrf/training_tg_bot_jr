@@ -1,3 +1,4 @@
+import logging
 from aiogram import Router, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -45,9 +46,10 @@ class InterpreterCommands(StatesGroup):
 
 @interpreter_router.message(Command('interpreter'))
 async def start_interpreter(message: types.Message, state: FSMContext):
-    image_fox = fox()
-    await message.answer_photo(image_fox)
-    await message.answer("Добро пожаловать в переводчик!\nВыберите язык пеервода:", 
+    image_fox = await fox()
+    if image_fox:
+        await message.answer_photo(image_fox)
+    await message.answer("Добро пожаловать в переводчик!\nВыберите язык перевода:", 
                          reply_markup=interpreter_keyboard)
     await state.set_state(InterpreterCommands.translation_language)
 
@@ -96,6 +98,14 @@ async def translate_text(
             question=message.text
         )
         
+        if not response:
+            await message.answer(
+                "❌ Ошибка при переводе. Попробуйте еще раз.",
+                reply_markup=action_keyboard
+            )
+            await state.set_state(InterpreterCommands.translator_mode)
+            return
+        
         # Форматируем ответ
         result = (
             f"🔍 **Перевод с русского на {target_language_ru}**\n\n"
@@ -107,10 +117,12 @@ async def translate_text(
         await state.set_state(InterpreterCommands.translator_mode)
         
     except Exception as e:
+        logging.error(f"Ошибка при переводе: {e}")
         await message.answer(
             "❌ Ошибка при переводе. Попробуйте еще раз.",
             reply_markup=action_keyboard
         )
+        await state.set_state(InterpreterCommands.translator_mode)
 
 @interpreter_router.message(InterpreterCommands.translator_mode, F.text == "🔄 Новый перевод")
 async def new_translation(message: types.Message, state: FSMContext):

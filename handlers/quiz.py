@@ -1,3 +1,6 @@
+import json
+import logging
+import re
 from aiogram import F, Router, types
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -35,23 +38,25 @@ quiz_topic = [
 ]
 
 system_quiz = """
-            Ты - ведущий квиза. Создай один интересный вопрос на указанную тему.
-            
-            Правила:
-            - Вопрос должен быть понятным и интересным
-            - 4 варианта ответа (A, B, C, D)
-            - Четко укажи правильный ответ
-            
-            Формат вывода:
-            ❓ [Вопрос]
-            
-            A) [Вариант A]
-            B) [Вариант B]
-            C) [Вариант C]
-            D) [Вариант D]
-            
-            ✅ Правильный ответ: [буква]
-            """
+Ты - ведущий квиза. Создай один интересный вопрос на указанную тему.
+
+Правила:
+- Вопрос должен быть понятным и интересным
+- 4 варианта ответа (A, B, C, D)
+- Четко укажи правильный ответ
+
+Формат вывода (строго JSON, без дополнительного текста):
+{
+    "question": "Текст вопроса",
+    "options": {
+        "A": "Вариант A",
+        "B": "Вариант B",
+        "C": "Вариант C",
+        "D": "Вариант D"
+    },
+    "correct": "A"
+}
+"""
 
 class TalkStates(StatesGroup):
     waiting_for_quiz = State()
@@ -62,8 +67,9 @@ class TalkStates(StatesGroup):
 @quiz_router.message(Command("quiz"))
 async def command_quiz(message: types.Message, state: FSMContext):
     await state.clear()
-    image_fox = fox()
-    await message.answer_photo(photo=image_fox)
+    image_fox = await fox()
+    if image_fox:
+        await message.answer_photo(photo=image_fox)
     await message.answer("🎯 Добро пожаловать в квиз!\nВыберите тему:", 
                          reply_markup=quiz_keyboard_start)
     await state.set_state(TalkStates.waiting_for_quiz)
@@ -83,20 +89,59 @@ async def generate_question(message: types.Message, chat_gpt_service: ChatGPTSer
     # Сохраняем тему в контекст
     await state.update_data(current_topic=selected_topic)
     
-    response = await chat_gpt_service.ask_gpt(system=system_quiz, question=selected_topic)
-    
-    # Сохраняем вопрос и правильный ответ
-    await state.update_data(current_question=response)
-    
-    # Простой парсинг правильного ответа
-    import re
-    match = re.search(r'✅ Правильный ответ:\s*([A-D])', response)
-    if match:
-        await state.update_data(correct_answer=match.group(1))
-    
-    await message.answer(response, reply_markup=types.ReplyKeyboardRemove())
-    await message.answer("📝 Введите ваш ответ (A, B, C или D):")
-    await state.set_state(TalkStates.waiting_for_answer)
+    try:
+        response = await chat_gpt_service.ask_gpt(system=system_quiz, question=selected_topic)
+        if not response:
+            await message.answer("❌ Не удалось сгенерировать вопрос. Попробуйте другую тему.")
+            return
+        
+        # Парсим JSON ответ
+        question_data = parse_quiz_response(response)
+        
+        if question_data:
+            await state.update_data(question_data=question_data)
+            await state.update_data(correct_answer=question_data["correct"])
+            
+            # Форматируем вопрос для отображения
+            formatted_question = (
+                f"❓ {question_data['question']}\n\n"
+                f"A) {question_data['options']['A']}\n"
+                f"B) {question_data['options']['B']}\n"
+                f"C) {question_data['options']['C']}\n"
+                f"D) {question_data['options']['D']}"
+            )
+            
+            await message.answer(formatted_question, reply_markup=types.ReplyKeyboardRemove())
+            await message.answer("📝 Введите ваш ответ (A, B, C или D):")
+            await state.set_state(TalkStates.waiting_for_answer)
+        else:
+            # Fallback: показываем сырой ответ
+            await state.update_data(current_question=response)
+            match = re.search(r'✅ Правильный ответ:\s*([A-D])', response)
+            if match:
+                await state.update_data(correct_answer=match.group(1))
+            
+            await message.answer(response, reply_markup=types.ReplyKeyboardRemove())
+            await message.answer("📝 Введите ваш ответ (A, B, C или D):")
+            await state.set_state(TalkStates.waiting_for_answer)
+            
+    except Exception as e:
+        logging.error(f"Ошибка в quiz хендлере: {e}")
+        await message.answer("❌ Произошла ошибка. Попробуйте ещё раз.")
+
+
+def parse_quiz_response(response: str) -> dict | None:
+    """Парсинг JSON ответа от ChatGPT для квиза"""
+    # Пробуем найти JSON в ответе
+    json_match = re.search(r'\{.*\}', response, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group())
+            if all(k in data for k in ("question", "options", "correct")):
+                return data
+        except json.JSONDecodeError:
+            pass
+    return None
 
 
 @quiz_router.message(F.text == "Ещё вопрос")
@@ -114,22 +159,49 @@ async def another_question(message: types.Message, chat_gpt_service: ChatGPTServ
     # Отправляем уведомление
     loading_msg = await message.answer("🔄 Генерирую новый вопрос...")
     
-    response = await chat_gpt_service.ask_gpt(system=system_quiz, question=current_topic)
-    
-    # Удаляем сообщение о загрузке
-    await loading_msg.delete()
-    
-    # Сохраняем новый вопрос и правильный ответ
-    await state.update_data(current_question=response)
-    
-    import re
-    match = re.search(r'✅ Правильный ответ:\s*([A-D])', response)
-    if match:
-        await state.update_data(correct_answer=match.group(1))
-    
-    await message.answer(response)
-    await message.answer("📝 Введите ваш ответ (A, B, C или D):")
-    await state.set_state(TalkStates.waiting_for_answer)
+    try:
+        response = await chat_gpt_service.ask_gpt(system=system_quiz, question=current_topic)
+        
+        # Удаляем сообщение о загрузке
+        await loading_msg.delete()
+        
+        if not response:
+            await message.answer("❌ Не удалось сгенерировать вопрос. Попробуйте ещё раз.")
+            return
+        
+        # Парсим JSON ответ
+        question_data = parse_quiz_response(response)
+        
+        if question_data:
+            await state.update_data(question_data=question_data)
+            await state.update_data(correct_answer=question_data["correct"])
+            
+            formatted_question = (
+                f"❓ {question_data['question']}\n\n"
+                f"A) {question_data['options']['A']}\n"
+                f"B) {question_data['options']['B']}\n"
+                f"C) {question_data['options']['C']}\n"
+                f"D) {question_data['options']['D']}"
+            )
+            
+            await message.answer(formatted_question)
+            await message.answer("📝 Введите ваш ответ (A, B, C или D):")
+            await state.set_state(TalkStates.waiting_for_answer)
+        else:
+            # Fallback: старый формат
+            await state.update_data(current_question=response)
+            match = re.search(r'✅ Правильный ответ:\s*([A-D])', response)
+            if match:
+                await state.update_data(correct_answer=match.group(1))
+            
+            await message.answer(response)
+            await message.answer("📝 Введите ваш ответ (A, B, C или D):")
+            await state.set_state(TalkStates.waiting_for_answer)
+            
+    except Exception as e:
+        logging.error(f"Ошибка при генерации вопроса: {e}")
+        await loading_msg.delete()
+        await message.answer("❌ Произошла ошибка. Попробуйте ещё раз.")
 
 
 @quiz_router.message(TalkStates.waiting_for_answer, F.text.upper().in_(["A", "B", "C", "D"]))
@@ -172,3 +244,12 @@ async def end_quiz(message: types.Message, state: FSMContext):
 async def invalid_answer_format(message: types.Message):
     """Некорректный формат ответа"""
     await message.answer("⚠️ Пожалуйста, введите ответ в формате: **A**, **B**, **C** или **D**")
+
+@quiz_router.message(Command('cancel'))
+async def cancel_quiz(message: types.Message, state: FSMContext):
+    """Отмена квиза"""
+    current_state = await state.get_state()
+    if current_state is None:
+        return
+    await state.clear()
+    await message.answer("❌ Квиз завершён досрочно", reply_markup=start_keyboard)
